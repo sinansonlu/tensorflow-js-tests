@@ -1,8 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TensorFlow.js Tutorial</title>
-
+    <title>Sequential Test 1</title>
     <!-- Import TensorFlow.js -->
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@2.0.0/dist/tf.min.js"></script>
     <!-- Import tfjs-vis -->
@@ -133,8 +132,8 @@ function convertToTensor(data) {
         tf.util.shuffle(data);
 
         // Step 2. Convert data to Tensor
-        const inputs = data.map(d => d.horsepower)
-            const labels = data.map(d => d.mpg);
+        const inputs = data.map(d => d.horsepower);
+		const labels = data.map(d => d.mpg);
 
         const inputTensor = tf.tensor2d(inputs, [inputs.length, 1]);
         const labelTensor = tf.tensor2d(labels, [labels.length, 1]);

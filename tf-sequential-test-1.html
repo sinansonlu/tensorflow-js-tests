@@ -75,8 +75,8 @@ function createModel() {
         }));
 
     model.add(tf.layers.batchNormalization());
-	
-	model.add(tf.layers.dropout({
+
+    model.add(tf.layers.dropout({
             rate: 0.125
         }));
 
@@ -86,8 +86,8 @@ function createModel() {
         }));
 
     model.add(tf.layers.batchNormalization());
-	
-	model.add(tf.layers.dropout({
+
+    model.add(tf.layers.dropout({
             rate: 0.25
         }));
 
@@ -97,8 +97,8 @@ function createModel() {
         }));
 
     model.add(tf.layers.batchNormalization());
-	
-	model.add(tf.layers.dropout({
+
+    model.add(tf.layers.dropout({
             rate: 0.25
         }));
 
@@ -133,7 +133,7 @@ function convertToTensor(data) {
 
         // Step 2. Convert data to Tensor
         const inputs = data.map(d => d.horsepower);
-		const labels = data.map(d => d.mpg);
+        const labels = data.map(d => d.mpg);
 
         const inputTensor = tf.tensor2d(inputs, [inputs.length, 1]);
         const labelTensor = tf.tensor2d(labels, [labels.length, 1]);
@@ -235,7 +235,6 @@ function testModel(model, inputData, normalizationData) {
         height: 300
     });
 }
-
 </script>
 </body>
 </html>

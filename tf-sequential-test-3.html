@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sequential Test 3</title>
+    <!-- Import TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@2.0.0/dist/tf.min.js"></script>
+    <!-- Import tfjs-vis -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@1.0.2/dist/tfjs-vis.umd.min.js"></script>
+</head>
+<body>
+
+<div class="tfjs-example-container centered-container">
+  <section>
+	<p class='section-head'>Training Progress</p>
+	<div class="with-rows">
+	  <div class="status">
+		<label id="train-status">Iteration #:</label>
+		<progress value="0" max="100" id="train-progress"></progress>
+	  </div>
+	  <div class="status">
+		<label id="iteration-status">Game #:</label>
+		<progress value="0" max="100" id="iteration-progress"></progress>
+	  </div>
+
+	  <div class="status">
+		<label>Training speed:</label>
+		<span id="train-speed" class="status-span"></span>
+	  </div>
+	  <div id="steps-container"></div>
+	</div>
+  </section>
+
+  <section>
+	<p class='section-head'>Simulation</p>
+	<div>
+	  <canvas id="cart-pole-canvas" height="150px" width="500px"></canvas>
+	</div>
+  </section>
+
+<script>
+
+function mean(xs) {
+    return sum(xs) / xs.length;
+}
+
+function sum(xs) {
+    if (xs.length === 0) {
+        throw new Error('Expected xs to be a non-empty Array.');
+    } else {
+        return xs.reduce((x, prev) => prev + x);
+    }
+}
+
+/**
+ * Cart-pole system simulator.
+ *
+ * In the control-theory sense, there are four state variables in this system:
+ *
+ *   - x: The 1D location of the cart.
+ *   - xDot: The velocity of the cart.
+ *   - theta: The angle of the pole (in radians). A value of 0 corresponds to
+ *     a vertical position.
+ *   - thetaDot: The angular velocity of the pole.
+ *
+ * The system is controlled through a single action:
+ *
+ *   - leftward or rightward force.
+ */
+class CartPole {
+
+    constructor() {
+        // Constants that characterize the system.
+        this.gravity = 9.8;
+        this.massCart = 1.0;
+        this.massPole = 0.1;
+        this.totalMass = this.massCart + this.massPole;
+        this.cartWidth = 0.2;
+        this.cartHeight = 0.1;
+        this.length = 0.5;
+        this.poleMoment = this.massPole * this.length;
+        this.forceMag = 10.0;
+        this.tau = 0.02; // Seconds between state updates.
+
+        // Threshold values, beyond which a simulation will be marked as failed.
+        this.xThreshold = 2.4;
+        this.thetaThreshold = 30 / 360 * 2 * Math.PI;
+
+        this.setRandomState();
+    }
+
+    setRandomState() {
+        // The control-theory state variables of the cart-pole system.
+        // Cart position, meters.
+        this.x = Math.random() - 0.5;
+        // Cart velocity.
+        this.xDot = (Math.random() - 0.5) * 1;
+        // Pole angle, radians.
+        this.theta = (Math.random() - 0.5) * 2 * (6 / 360 * 2 * Math.PI);
+        // Pole angle velocity.
+        this.thetaDot = (Math.random() - 0.5) * 0.5;
+    }
+
+    /**
+     * Get current state as a tf.Tensor of shape [1, 4].
+     */
+    getStateTensor() {
+        return tf.tensor2d([[this.x, this.xDot, this.theta, this.thetaDot]]);
+    }
+
+    /**
+     * Update the cart-pole system using an action.
+     * @param {number} action Only the sign of `action` matters.
+     *   A value > 0 leads to a rightward force of a fixed magnitude.
+     *   A value <= 0 leads to a leftward force of the same fixed magnitude.
+     */
+    update(action) {
+        const force = action > 0 ? this.forceMag : -this.forceMag;
+
+        const cosTheta = Math.cos(this.theta);
+        const sinTheta = Math.sin(this.theta);
+
+        const temp =
+            (force + this.poleMoment * this.thetaDot * this.thetaDot * sinTheta) /
+        this.totalMass;
+        const thetaAcc = (this.gravity * sinTheta - cosTheta * temp) /
+        (this.length *
+            (4 / 3 - this.massPole * cosTheta * cosTheta / this.totalMass));
+        const xAcc = temp - this.poleMoment * thetaAcc * cosTheta / this.totalMass;
+
+        // Update the four state variables, using Euler's method.
+        this.x += this.tau * this.xDot;
+        this.xDot += this.tau * xAcc;
+        this.theta += this.tau * this.thetaDot;
+        this.thetaDot += this.tau * thetaAcc;
+
+        return this.isDone();
+    }
+
+    /**
+     * Determine whether this simulation is done.
+     *
+     * A simulation is done when `x` (position of the cart) goes out of bound
+     * or when `theta` (angle of the pole) goes out of bound.
+     *
+     * @returns {bool} Whether the simulation is done.
+     */
+    isDone() {
+        return this.x < -this.xThreshold || this.x > this.xThreshold ||
+        this.theta < -this.thetaThreshold || this.theta > this.thetaThreshold;
+    }
+}
+
+const cartPoleCanvas = document.getElementById('cart-pole-canvas');
+
+const iterationStatus = document.getElementById('iteration-status');
+const iterationProgress = document.getElementById('iteration-progress');
+const trainStatus = document.getElementById('train-status');
+const trainSpeed = document.getElementById('train-speed');
+const trainProgress = document.getElementById('train-progress');
+
+const stepsContainer = document.getElementById('steps-container');
+
+// Module-global instance of policy network.
+let policyNet;
+
+// Objects and functions to support display of cart pole status during training.
+let renderDuringTraining = true;
+async function maybeRenderDuringTraining(cartPole) {
+    if (renderDuringTraining) {
+        renderCartPole(cartPole, cartPoleCanvas);
+        await tf.nextFrame(); // Unblock UI thread.
+    }
+}
+
+/**
+ * A function invoked at the end of every game during training.
+ *
+ * @param {number} gameCount A count of how many games has completed so far in
+ *   the current iteration of training.
+ * @param {number} totalGames Total number of games to complete in the current
+ *   iteration of training.
+ */
+function onGameEnd(gameCount, totalGames) {
+    iterationStatus.textContent = `Game ${gameCount} of ${totalGames}`;
+    iterationProgress.value = gameCount / totalGames * 100;
+    if (gameCount === totalGames) {
+        iterationStatus.textContent = 'Updating weights...';
+    }
+}
+
+/**
+ * A function invokved at the end of a training iteration.
+ *
+ * @param {number} iterationCount A count of how many iterations has completed
+ *   so far in the current round of training.
+ * @param {*} totalIterations Total number of iterations to complete in the
+ *   current round of training.
+ */
+function onIterationEnd(iterationCount, totalIterations) {
+    trainStatus.textContent = `Iteration ${iterationCount} of ${totalIterations}`;
+    trainProgress.value = iterationCount / totalIterations * 100;
+}
+
+// Objects and function to support the plotting of game steps during training.
+let meanStepValues = [];
+function plotSteps() {
+    tfvis.render.linechart(stepsContainer, {
+        values: meanStepValues
+    }, {
+        xLabel: 'Training Iteration',
+        yLabel: 'Mean Steps Per Game',
+        width: 400,
+        height: 300,
+    });
+}
+
+/**
+ * Render the current state of the system on an HTML canvas.
+ *
+ * @param {CartPole} cartPole The instance of cart-pole system to render.
+ * @param {HTMLCanvasElement} canvas The instance of HTMLCanvasElement on which
+ *   the rendering will happen.
+ */
+function renderCartPole(cartPole, canvas) {
+    if (!canvas.style.display) {
+        canvas.style.display = 'block';
+    }
+    const X_MIN = -cartPole.xThreshold;
+    const X_MAX = cartPole.xThreshold;
+    const xRange = X_MAX - X_MIN;
+    const scale = canvas.width / xRange;
+
+    const context = canvas.getContext('2d');
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    const halfW = canvas.width / 2;
+
+    // Draw the cart.
+    const railY = canvas.height * 0.8;
+    const cartW = cartPole.cartWidth * scale;
+    const cartH = cartPole.cartHeight * scale;
+
+    const cartX = cartPole.x * scale + halfW;
+
+    context.beginPath();
+    context.strokeStyle = '#000000';
+    context.lineWidth = 2;
+    context.rect(cartX - cartW / 2, railY - cartH / 2, cartW, cartH);
+    context.stroke();
+
+    // Draw the wheels under the cart.
+    const wheelRadius = cartH / 4;
+    for (const offsetX of[-1, 1]) {
+        context.beginPath();
+        context.lineWidth = 2;
+        context.arc(
+            cartX - cartW / 4 * offsetX, railY + cartH / 2 + wheelRadius,
+            wheelRadius, 0, 2 * Math.PI);
+        context.stroke();
+    }
+
+    // Draw the pole.
+    const angle = cartPole.theta + Math.PI / 2;
+    const poleTopX =
+        halfW + scale * (cartPole.x + Math.cos(angle) * cartPole.length);
+    const poleTopY = railY -
+        scale * (cartPole.cartHeight / 2 + Math.sin(angle) * cartPole.length);
+    context.beginPath();
+    context.strokeStyle = '#ffa500';
+    context.lineWidth = 6;
+    context.moveTo(cartX, railY - cartH / 2);
+    context.lineTo(poleTopX, poleTopY);
+    context.stroke();
+
+    // Draw the ground.
+    const groundY = railY + cartH / 2 + wheelRadius * 2;
+    context.beginPath();
+    context.strokeStyle = '#000000';
+    context.lineWidth = 1;
+    context.moveTo(0, groundY);
+    context.lineTo(canvas.width, groundY);
+    context.stroke();
+
+    const nDivisions = 40;
+    for (let i = 0; i < nDivisions; ++i) {
+        const x0 = canvas.width / nDivisions * i;
+        const x1 = x0 + canvas.width / nDivisions / 2;
+        const y0 = groundY + canvas.width / nDivisions / 2;
+        const y1 = groundY;
+        context.beginPath();
+        context.moveTo(x0, y0);
+        context.lineTo(x1, y1);
+        context.stroke();
+    }
+
+    // Draw the left and right limits.
+    const limitTopY = groundY - canvas.height / 2;
+    context.beginPath();
+    context.strokeStyle = '#ff0000';
+    context.lineWidth = 2;
+    context.moveTo(1, groundY);
+    context.lineTo(1, limitTopY);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(canvas.width - 1, groundY);
+    context.lineTo(canvas.width - 1, limitTopY);
+    context.stroke();
+}
+
+/*sync function setUpUI() {
+    const cartPole = new CartPole(true);
+
+    if (await SaveablePolicyNetwork.checkStoredModelStatus() != null) {
+        policyNet = await SaveablePolicyNetwork.loadModel();
+        logStatus('Loaded policy network from IndexedDB.');
+        hiddenLayerSizesInput.value = policyNet.hiddenLayerSizes();
+    }
+
+    deleteStoredModelButton.addEventListener('click', async() => {
+        if (confirm(`Are you sure you want to delete the locally-stored model?`)) {
+            await policyNet.removeModel();
+            policyNet = null;
+            await updateUIControlState();
+        }
+    });
+
+    testButton.addEventListener('click', async() => {
+        disableModelControls();
+        let isDone = false;
+        const cartPole = new CartPole(true);
+        cartPole.setRandomState();
+        let steps = 0;
+        while (!isDone) {
+            steps++;
+            tf.tidy(() => {
+                const action = policyNet.getActions(cartPole.getStateTensor())[0];
+                logStatus(
+                    `Test in progress. ` + 
+`Action: ${action === 1 ? '<--' : ' -->'} (Step ${steps})`);
+                isDone = cartPole.update(action);
+                renderCartPole(cartPole, cartPoleCanvas);
+            });
+            await tf.nextFrame(); // Unblock UI thread.
+        }
+        
+        console.log(`# of tensors: ${tf.memory().numTensors}`);
+        enableModelControls();
+    });
+}*/
+
+/**
+ * Policy network for controlling the cart-pole system.
+ *
+ * The role of the policy network is to select an action based on the observed
+ * state of the system. In this case, the action is the leftward or rightward
+ * force and the observed system state is a four-dimensional vector, consisting
+ * of cart position, cart velocity, pole angle and pole angular velocity.
+ *
+ */
+class PolicyNetwork {
+    /**
+     * Constructor of PolicyNetwork.
+     *
+     * @param {number | number[] | tf.LayersModel} hiddenLayerSizes
+     *   Can be any of the following
+     *   - Size of the hidden layer, as a single number (for a single hidden
+     *     layer)
+     *   - An Array of numbers (for any number of hidden layers).
+     *   - An instance of tf.LayersModel.
+     */
+    constructor(hiddenLayerSizesOrModel) {
+        if (hiddenLayerSizesOrModel instanceof tf.LayersModel) {
+            this.policyNet = hiddenLayerSizesOrModel;
+        } else {
+            this.createPolicyNetwork(hiddenLayerSizesOrModel);
+        }
+    }
+
+    /**
+     * Create the underlying model of this policy network.
+     *
+     * @param {number | number[]} hiddenLayerSizes Size of the hidden layer, as
+     *   a single number (for a single hidden layer) or an Array of numbers (for
+     *   any number of hidden layers).
+     */
+    createPolicyNetwork(hiddenLayerSizes) {
+        if (!Array.isArray(hiddenLayerSizes)) {
+            hiddenLayerSizes = [hiddenLayerSizes];
+        }
+        this.policyNet = tf.sequential();
+        hiddenLayerSizes.forEach((hiddenLayerSize, i) => {
+            this.policyNet.add(tf.layers.dense({
+                    units: hiddenLayerSize,
+                    activation: 'elu',
+                    // `inputShape` is required only for the first layer.
+                    inputShape: i === 0 ? [4] : undefined
+                }));
+        });
+        // The last layer has only one unit. The single output number will be
+        // converted to a probability of selecting the leftward-force action.
+        this.policyNet.add(tf.layers.dense({
+                units: 1
+            }));
+    }
+
+    /**
+     * Train the policy network's model.
+     *
+     * @param {CartPole} cartPoleSystem The cart-pole system object to use during
+     *   training.
+     * @param {tf.train.Optimizer} optimizer An instance of TensorFlow.js
+     *   Optimizer to use for training.
+     * @param {number} discountRate Reward discounting rate: a number between 0
+     *   and 1.
+     * @param {number} numGames Number of game to play for each model parameter
+     *   update.
+     * @param {number} maxStepsPerGame Maximum number of steps to perform during
+     *   a game. If this number is reached, the game will end immediately.
+     * @returns {number[]} The number of steps completed in the `numGames` games
+     *   in this round of training.
+     */
+    async train(
+        cartPoleSystem, optimizer, discountRate, numGames, maxStepsPerGame) {
+        const allGradients = [];
+        const allRewards = [];
+        const gameSteps = [];
+        onGameEnd(0, numGames);
+        for (let i = 0; i < numGames; ++i) {
+            // Randomly initialize the state of the cart-pole system at the beginning
+            // of every game.
+            cartPoleSystem.setRandomState();
+            const gameRewards = [];
+            const gameGradients = [];
+            for (let j = 0; j < maxStepsPerGame; ++j) {
+                // For every step of the game, remember gradients of the policy
+                // network's weights with respect to the probability of the action
+                // choice that lead to the reward.
+                const gradients = tf.tidy(() => {
+                    const inputTensor = cartPoleSystem.getStateTensor();
+                    return this.getGradientsAndSaveActions(inputTensor).grads;
+                });
+
+                this.pushGradients(gameGradients, gradients);
+                const action = this.currentActions_[0];
+                const isDone = cartPoleSystem.update(action);
+
+                await maybeRenderDuringTraining(cartPoleSystem);
+
+                if (isDone) {
+                    // When the game ends before max step count is reached, a reward of
+                    // 0 is given.
+                    gameRewards.push(0);
+                    break;
+                } else {
+                    // As long as the game doesn't end, each step leads to a reward of 1.
+                    // These reward values will later be "discounted", leading to
+                    // higher reward values for longer-lasting games.
+                    gameRewards.push(1);
+                }
+            }
+            onGameEnd(i + 1, numGames);
+            gameSteps.push(gameRewards.length);
+            this.pushGradients(allGradients, gameGradients);
+            allRewards.push(gameRewards);
+            await tf.nextFrame();
+        }
+
+        tf.tidy(() => {
+            // The following line does three things:
+            // 1. Performs reward discounting, i.e., make recent rewards count more
+            //    than rewards from the further past. The effect is that the reward
+            //    values from a game with many steps become larger than the values
+            //    from a game with fewer steps.
+            // 2. Normalize the rewards, i.e., subtract the global mean value of the
+            //    rewards and divide the result by the global standard deviation of
+            //    the rewards. Together with step 1, this makes the rewards from
+            //    long-lasting games positive and rewards from short-lasting
+            //    negative.
+            // 3. Scale the gradients with the normalized reward values.
+            const normalizedRewards =
+                discountAndNormalizeRewards(allRewards, discountRate);
+            // Add the scaled gradients to the weights of the policy network. This
+            // step makes the policy network more likely to make choices that lead
+            // to long-lasting games in the future (i.e., the crux of this RL
+            // algorithm.)
+            optimizer.applyGradients(
+                scaleAndAverageGradients(allGradients, normalizedRewards));
+        });
+        tf.dispose(allGradients);
+        return gameSteps;
+    }
+
+    getGradientsAndSaveActions(inputTensor) {
+        const f = () => tf.tidy(() => {
+            const [logits, actions] = this.getLogitsAndActions(inputTensor);
+            this.currentActions_ = actions.dataSync();
+            const labels =
+                tf.sub(1, tf.tensor2d(this.currentActions_, actions.shape));
+            return tf.losses.sigmoidCrossEntropy(labels, logits).asScalar();
+        });
+        return tf.variableGrads(f);
+    }
+
+    getCurrentActions() {
+        return this.currentActions_;
+    }
+
+    /**
+     * Get policy-network logits and the action based on state-tensor inputs.
+     *
+     * @param {tf.Tensor} inputs A tf.Tensor instance of shape `[batchSize, 4]`.
+     * @returns {[tf.Tensor, tf.Tensor]}
+     *   1. The logits tensor, of shape `[batchSize, 1]`.
+     *   2. The actions tensor, of shape `[batchSize, 1]`.
+     */
+    getLogitsAndActions(inputs) {
+        return tf.tidy(() => {
+            const logits = this.policyNet.predict(inputs);
+
+            // Get the probability of the leftward action.
+            const leftProb = tf.sigmoid(logits);
+            // Probabilites of the left and right actions.
+            const leftRightProbs = tf.concat([leftProb, tf.sub(1, leftProb)], 1);
+            const actions = tf.multinomial(leftRightProbs, 1, null, true);
+            return [logits, actions];
+        });
+    }
+
+    /**
+     * Get actions based on a state-tensor input.
+     *
+     * @param {tf.Tensor} inputs A tf.Tensor instance of shape `[batchSize, 4]`.
+     * @param {Float32Array} inputs The actions for the inputs, with length
+     *   `batchSize`.
+     */
+    getActions(inputs) {
+        return this.getLogitsAndActions(inputs)[1].dataSync();
+    }
+
+    /**
+     * Push a new dictionary of gradients into records.
+     *
+     * @param {{[varName: string]: tf.Tensor[]}} record The record of variable
+     *   gradient: a map from variable name to the Array of gradient values for
+     *   the variable.
+     * @param {{[varName: string]: tf.Tensor}} gradients The new gradients to push
+     *   into `record`: a map from variable name to the gradient Tensor.
+     */
+    pushGradients(record, gradients) {
+        for (const key in gradients) {
+            if (key in record) {
+                record[key].push(gradients[key]);
+            } else {
+                record[key] = [gradients[key]];
+            }
+        }
+    }
+}
+
+// The IndexedDB path where the model of the policy network will be saved.
+const MODEL_SAVE_PATH_ = 'indexeddb://cart-pole-v1';
+
+/**
+ * A subclass of PolicyNetwork that supports saving and loading.
+ */
+class SaveablePolicyNetwork extends PolicyNetwork {
+    /**
+     * Constructor of SaveablePolicyNetwork
+     *
+     * @param {number | number[]} hiddenLayerSizesOrModel
+     */
+    constructor(hiddenLayerSizesOrModel) {
+        super(hiddenLayerSizesOrModel);
+    }
+
+    /**
+     * Save the model to IndexedDB.
+     */
+    async saveModel() {
+        return await this.policyNet.save(MODEL_SAVE_PATH_);
+    }
+
+    /**
+     * Load the model fom IndexedDB.
+     *
+     * @returns {SaveablePolicyNetwork} The instance of loaded
+     *   `SaveablePolicyNetwork`.
+     * @throws {Error} If no model can be found in IndexedDB.
+     */
+    static async loadModel() {
+        const modelsInfo = await tf.io.listModels();
+        if (MODEL_SAVE_PATH_ in modelsInfo) {
+            console.log(`Loading existing model...`);
+            const model = await tf.loadLayersModel(MODEL_SAVE_PATH_);
+            console.log(`Loaded model from ${MODEL_SAVE_PATH_}`);
+            return new SaveablePolicyNetwork(model);
+        } else {
+            throw new Error(`Cannot find model at ${MODEL_SAVE_PATH_}.`);
+        }
+    }
+
+    /**
+     * Check the status of locally saved model.
+     *
+     * @returns If the locally saved model exists, the model info as a JSON
+     *   object. Else, `undefined`.
+     */
+    static async checkStoredModelStatus() {
+        const modelsInfo = await tf.io.listModels();
+        return modelsInfo[MODEL_SAVE_PATH_];
+    }
+
+    /**
+     * Remove the locally saved model from IndexedDB.
+     */
+    async removeModel() {
+        return await tf.io.removeModel(MODEL_SAVE_PATH_);
+    }
+
+    /**
+     * Get the sizes of the hidden layers.
+     *
+     * @returns {number | number[]} If the model has only one hidden layer,
+     *   return the size of the layer as a single number. If the model has
+     *   multiple hidden layers, return the sizes as an Array of numbers.
+     */
+    hiddenLayerSizes() {
+        const sizes = [];
+        for (let i = 0; i < this.policyNet.layers.length - 1; ++i) {
+            sizes.push(this.policyNet.layers[i].units);
+        }
+        return sizes.length === 1 ? sizes[0] : sizes;
+    }
+}
+
+/**
+ * Discount the reward values.
+ *
+ * @param {number[]} rewards The reward values to be discounted.
+ * @param {number} discountRate Discount rate: a number between 0 and 1, e.g.,
+ *   0.95.
+ * @returns {tf.Tensor} The discounted reward values as a 1D tf.Tensor.
+ */
+function discountRewards(rewards, discountRate) {
+    const discountedBuffer = tf.buffer([rewards.length]);
+    let prev = 0;
+    for (let i = rewards.length - 1; i >= 0; --i) {
+        const current = discountRate * prev + rewards[i];
+        discountedBuffer.set(current, i);
+        prev = current;
+    }
+    return discountedBuffer.toTensor();
+}
+
+/**
+ * Discount and normalize reward values.
+ *
+ * This function performs two steps:
+ *
+ * 1. Discounts the reward values using `discountRate`.
+ * 2. Normalize the reward values with the global reward mean and standard
+ *    deviation.
+ *
+ * @param {number[][]} rewardSequences Sequences of reward values.
+ * @param {number} discountRate Discount rate: a number between 0 and 1, e.g.,
+ *   0.95.
+ * @returns {tf.Tensor[]} The discounted and normalize reward values as an
+ *   Array of tf.Tensor.
+ */
+function discountAndNormalizeRewards(rewardSequences, discountRate) {
+    return tf.tidy(() => {
+        const discounted = [];
+        for (const sequence of rewardSequences) {
+            discounted.push(discountRewards(sequence, discountRate))
+        }
+        // Compute the overall mean and stddev.
+        const concatenated = tf.concat(discounted);
+        const mean = tf.mean(concatenated);
+        const std = tf.sqrt(tf.mean(tf.square(concatenated.sub(mean))));
+        // Normalize the reward sequences using the mean and std.
+        const normalized = discounted.map(rs => rs.sub(mean).div(std));
+        return normalized;
+    });
+}
+
+/**
+ * Scale the gradient values using normalized reward values and compute average.
+ *
+ * The gradient values are scaled by the normalized reward values. Then they
+ * are averaged across all games and all steps.
+ *
+ * @param {{[varName: string]: tf.Tensor[][]}} allGradients A map from variable
+ *   name to all the gradient values for the variable across all games and all
+ *   steps.
+ * @param {tf.Tensor[]} normalizedRewards An Array of normalized reward values
+ *   for all the games. Each element of the Array is a 1D tf.Tensor of which
+ *   the length equals the number of steps in the game.
+ * @returns {{[varName: string]: tf.Tensor}} Scaled and averaged gradients
+ *   for the variables.
+ */
+function scaleAndAverageGradients(allGradients, normalizedRewards) {
+    return tf.tidy(() => {
+        const gradients = {};
+        for (const varName in allGradients) {
+            gradients[varName] = tf.tidy(() => {
+                // Stack gradients together.
+                const varGradients = allGradients[varName].map(
+                        varGameGradients => tf.stack(varGameGradients));
+                // Expand dimensions of reward tensors to prepare for multiplication
+                // with broadcasting.
+                const expandedDims = [];
+                for (let i = 0; i < varGradients[0].rank - 1; ++i) {
+                    expandedDims.push(1);
+                }
+                const reshapedNormalizedRewards = normalizedRewards.map(
+                        rs => rs.reshape(rs.shape.concat(expandedDims)));
+                for (let g = 0; g < varGradients.length; ++g) {
+                    // This mul() call uses broadcasting.
+                    varGradients[g] = varGradients[g].mul(reshapedNormalizedRewards[g]);
+                }
+                // Concatenate the scaled gradients together, then average them across
+                // all the steps of all the games.
+                return tf.mean(tf.concat(varGradients, 0), 0);
+            });
+        }
+        return gradients;
+    });
+}
+
+async function myStart() {
+    const cartPole = new CartPole(true);
+
+    const hiddenLayerSizes = [4,8,4];
+	
+    policyNet = new SaveablePolicyNetwork(hiddenLayerSizes);
+    console.log('DONE constructing new instance of SaveablePolicyNetwork');
+
+    const trainIterations = 20;
+    const gamesPerIteration = 20;
+    const maxStepsPerGame = 500;
+    const discountRate = 0.95;
+    const learningRate = 0.05;
+
+    console.log('training...');
+    const optimizer = tf.train.adam(learningRate);
+
+    meanStepValues = [];
+    onIterationEnd(0, trainIterations);
+    let t0 = new Date().getTime();
+    for (let i = 0; i < trainIterations; ++i) {
+        const gameSteps = await policyNet.train(
+                cartPole, optimizer, discountRate, gamesPerIteration,
+                maxStepsPerGame);
+        const t1 = new Date().getTime();
+        const stepsPerSecond = sum(gameSteps) / ((t1 - t0) / 1e3);
+        t0 = t1;
+        trainSpeed.textContent = `${stepsPerSecond.toFixed(1)} steps/s`
+            meanStepValues.push({
+                x: i + 1,
+                y: mean(gameSteps)
+            });
+        console.log(`# of tensors: ${tf.memory().numTensors}`);
+        plotSteps();
+        onIterationEnd(i + 1, trainIterations);
+        await tf.nextFrame(); // Unblock UI thread.
+    }
+	
+	console.log('saving model...');
+	await policyNet.saveModel();
+}
+
+myStart();
+
+</script>
+</body>
+</html>

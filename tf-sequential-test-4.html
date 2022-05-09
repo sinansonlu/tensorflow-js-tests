@@ -114,7 +114,8 @@ class CartPole {
      *   A value <= 0 leads to a leftward force of the same fixed magnitude.
      */
     update(action) {
-        const force = action > 0 ? this.forceMag : -this.forceMag;
+        const force = action[0] > 0 ? this.forceMag : -this.forceMag;
+		if(action[1] > 0) this.force += this.forceMag; else this.force -= this.forceMag;
 
         const cosTheta = Math.cos(this.theta);
         const sinTheta = Math.sin(this.theta);
@@ -398,7 +399,7 @@ class PolicyNetwork {
         // The last layer has only one unit. The single output number will be
         // converted to a probability of selecting the leftward-force action.
         this.policyNet.add(tf.layers.dense({
-                units: 1
+                units: 2
             }));
     }
 
@@ -440,7 +441,7 @@ class PolicyNetwork {
                 });
 
                 this.pushGradients(gameGradients, gradients);
-                const action = this.currentActions_[0];
+                const action = this.currentActions_;
                 const isDone = cartPoleSystem.update(action);
 
                 await maybeRenderDuringTraining(cartPoleSystem);
@@ -454,7 +455,8 @@ class PolicyNetwork {
                     // As long as the game doesn't end, each step leads to a reward of 1.
                     // These reward values will later be "discounted", leading to
                     // higher reward values for longer-lasting games.
-                    gameRewards.push(1);
+					// being close to center is better
+                    gameRewards.push(cartPoleSystem.xThreshold - Math.abs(cartPoleSystem.x));
                 }
             }
             onGameEnd(i + 1, numGames);
@@ -493,8 +495,11 @@ class PolicyNetwork {
         const f = () => tf.tidy(() => {
             const [logits, actions] = this.getLogitsAndActions(inputTensor);
             this.currentActions_ = actions.dataSync();
+			
+			// console.log(tf.tensor2d(this.currentActions_, actions.shape)); //print();
             const labels =
-                tf.sub(1, tf.tensor2d(this.currentActions_, actions.shape));
+                tf.sub(1, tf.tensor2d(this.currentActions_, [1,2]));
+
             return tf.losses.sigmoidCrossEntropy(labels, logits).asScalar();
         });
         return tf.variableGrads(f);
@@ -518,9 +523,18 @@ class PolicyNetwork {
 
             // Get the probability of the leftward action.
             const leftProb = tf.sigmoid(logits);
+			
+			
+			
             // Probabilites of the left and right actions.
             const leftRightProbs = tf.concat([leftProb, tf.sub(1, leftProb)], 1);
-            const actions = tf.multinomial(leftRightProbs, 1, null, true);
+			
+			
+			const actions = tf.concat([
+				tf.multinomial(leftRightProbs.gather(0).gather([0,2]), 1, null, true),
+				tf.multinomial(leftRightProbs.gather(0).gather([1,3]), 1, null, true)
+				]);
+			// actions.print();
             return [logits, actions];
         });
     }
